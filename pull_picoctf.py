@@ -36,6 +36,11 @@ from pathlib import Path
 
 import aiohttp
 import yaml
+try:
+    import cloudscraper  # pip install cloudscraper
+    HAS_CLOUDSCRAPER = True
+except ImportError:
+    HAS_CLOUDSCRAPER = False
 
 BASE_URL = "https://play.picoctf.org"
 USER_AGENT = (
@@ -96,6 +101,31 @@ async def login(session: aiohttp.ClientSession, username: str, password: str) ->
         else:
             print(f"ERROR: Login returned {r.status}. Try --session instead.", file=sys.stderr)
         return False
+
+
+def _login_cloudscraper(username: str, password: str) -> str:
+    """Login using cloudscraper which handles Cloudflare JS challenges."""
+    scraper = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+    # Get CSRF
+    r = scraper.get(f"{BASE_URL}/login")
+    csrf = _find_csrf(r.text)
+    if not csrf:
+        print("ERROR: Could not get CSRF token even with cloudscraper.", file=sys.stderr)
+        print("  → Use --session instead (copy sessionid from browser DevTools)", file=sys.stderr)
+        return ""
+    # POST login
+    r = scraper.post(
+        f"{BASE_URL}/login",
+        data={"username": username, "password": password, "csrfmiddlewaretoken": csrf},
+        headers={"Referer": f"{BASE_URL}/login"},
+        allow_redirects=False,
+    )
+    if r.status_code in (301, 302):
+        return scraper.cookies.get("sessionid", "")
+    print("ERROR: Login failed — check username/password.", file=sys.stderr)
+    return ""
 
 
 def _find_csrf(html: str) -> str:
@@ -263,8 +293,20 @@ async def main(
             if not username:
                 print("ERROR: Provide --username/--password or --session", file=sys.stderr)
                 sys.exit(1)
-            if not await login(session, username, password):
-                sys.exit(1)
+            # Try cloudscraper first (handles Cloudflare)
+            if HAS_CLOUDSCRAPER:
+                sid = _login_cloudscraper(username, password)
+                if sid:
+                    # Inject the session cookie
+                    session.cookie_jar.update_cookies({"sessionid": sid}, aiohttp.ClientConnectorError)
+                    cookies["sessionid"] = sid
+                    print(f"✓ Logged in as {username} (via cloudscraper)")
+                else:
+                    sys.exit(1)
+            else:
+                if not await login(session, username, password):
+                    print("\nTip: pip install cloudscraper  — handles Cloudflare automatically", file=sys.stderr)
+                    sys.exit(1)
 
         # Fetch challenge list
         print("Fetching challenge list...")
