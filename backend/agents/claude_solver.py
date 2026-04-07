@@ -32,6 +32,7 @@ from backend.prompts import ChallengeMeta, build_prompt, list_distfiles
 from backend.sandbox import DockerSandbox
 from backend.solver_base import CANCELLED, ERROR, FLAG_FOUND, GAVE_UP, QUOTA_ERROR, SolverResult
 from backend.tracing import SolverTracer
+from backend.reflexion import SolveReflection, reflect
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,10 @@ class ClaudeSolver:
         self._findings = ""
         self._cost_usd = 0.0
         self._bump_insights: str | None = None
+        # Reflexion state
+        self._reflection: SolveReflection | None = None
+        self._sibling_insights_pending: str = ""
+        self._bump_count: int = 0
 
     async def start(self) -> None:
         await self.sandbox.start()
@@ -287,7 +292,14 @@ class ClaudeSolver:
         steps_before = self._step_count
 
         try:
-            if self._bump_insights:
+            reflection = self._reflection
+            sibling = self._sibling_insights_pending
+            if reflection is not None and not self._session_id:
+                # Fresh session after reflect_and_reset
+                prompt = reflection.to_prompt_block(sibling)
+                self._reflection = None
+                self._sibling_insights_pending = ""
+            elif self._bump_insights:
                 prompt = (
                     "Your previous attempt did not find the flag. "
                     f"Insights from other agents:\n\n{self._bump_insights}\n\n"
@@ -355,11 +367,41 @@ class ClaudeSolver:
                 return self._result(QUOTA_ERROR)
             return self._result(ERROR)
 
+    async def reflect_and_reset(self, sibling_insights: str = "") -> None:
+        """Close session, reflect on tracer log, start fresh with structured context."""
+        self._bump_count += 1
+        # Load trace events as pseudo messages for reflect()
+        pseudo = _tracer_log_to_pseudo_messages(self.tracer.path)
+        reflection = await reflect(
+            messages=pseudo,
+            bump_index=self._bump_count,
+            cheap_model=getattr(self.settings, "reflection_model", "openai:gpt-4o-mini"),
+        )
+        self._reflection = reflection
+        self._sibling_insights_pending = sibling_insights
+        # Close session so next run opens a fresh one with reflection as first prompt
+        if self._client:
+            try:
+                await self._client.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._client = None
+            self._session_id = None
+        self._bump_insights = None
+        self.loop_detector.reset()
+        self.tracer.event("reflect_and_reset", bump_index=self._bump_count,
+                          reflection_tokens=reflection.token_estimate(),
+                          facts=len(reflection.confirmed_facts),
+                          failed=len(reflection.failed_approaches))
+        logger.info(f"[{self.agent_name}] reflect_and_reset #{self._bump_count}: "
+                    f"session closed → {reflection.token_estimate()} reflection tokens")
+
     def bump(self, insights: str) -> None:
+        """Legacy bump — use reflect_and_reset() instead."""
         self._bump_insights = insights
         self.loop_detector.reset()
-        self.tracer.event("bump", insights=insights[:500])
-        logger.info(f"[{self.agent_name}] Bumped with insights (session {self._session_id})")
+        self.tracer.event("bump_legacy", insights=insights[:500])
+        logger.info(f"[{self.agent_name}] Legacy bump (session {self._session_id})")
 
     def _result(self, status: str, run_steps: int | None = None, run_cost: float | None = None) -> SolverResult:
         self.tracer.event("finish", status=status, flag=self._flag, confirmed=self._confirmed, cost_usd=round(self._cost_usd, 4))
@@ -383,3 +425,52 @@ class ClaudeSolver:
             self._client = None
         if self.sandbox:
             await self.sandbox.stop()
+
+
+# ─── Tracer log → pseudo messages (for reflect()) ────────────────────────────
+
+def _tracer_log_to_pseudo_messages(path: str) -> list:
+    """Read JSONL tracer log and return pseudo pydantic-ai message objects."""
+    import json
+    from pathlib import Path
+    try:
+        from pydantic_ai.messages import (
+            ModelRequest, ModelResponse,
+            ToolReturnPart, ToolCallPart, TextPart, UserPromptPart,
+        )
+        use_real = True
+    except ImportError:
+        use_real = False
+
+    messages = []
+    try:
+        for line in Path(path).read_text().splitlines():
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            etype = ev.get("type")
+            if not use_real:
+                continue
+            if etype == "tool_call":
+                try:
+                    args = json.loads(ev.get("args", "{}"))
+                except Exception:
+                    args = {"raw": ev.get("args", "")}
+                messages.append(ModelResponse(parts=[ToolCallPart(
+                    tool_name=ev.get("tool", "?"), args=args,
+                    tool_call_id=str(ev.get("step", "")),
+                )]))
+            elif etype == "tool_result":
+                messages.append(ModelRequest(parts=[ToolReturnPart(
+                    tool_name=ev.get("tool", "?"),
+                    content=ev.get("result", "")[:500],
+                    tool_call_id=str(ev.get("step", "")),
+                )]))
+            elif etype == "model_response":
+                text = ev.get("text", "")
+                if text:
+                    messages.append(ModelResponse(parts=[TextPart(content=text)]))
+    except Exception:
+        pass
+    return messages

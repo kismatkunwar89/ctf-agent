@@ -26,6 +26,26 @@ DEFAULT_MODELS: list[str] = [
     "codex/gpt-5.3-codex",
 ]
 
+# Free local models via Ollama (no API cost, requires GPU/CPU)
+# Install: https://ollama.com  then: ollama pull <model>
+OLLAMA_MODELS: list[str] = [
+    "ollama/qwen2.5-coder:32b",   # best CTF solver (~20GB VRAM)
+    "ollama/qwen2.5-coder:14b",   # good balance (~10GB VRAM)
+    "ollama/qwen2.5-coder:7b",    # fast, lower quality (~5GB VRAM)
+    "ollama/deepseek-r1:14b",     # strong reasoning (~9GB VRAM)
+    "ollama/llama3.1:8b",         # general fallback (~5GB VRAM)
+]
+
+# Free-tier cloud models via OpenRouter (rate-limited but no cost)
+OPENROUTER_FREE_MODELS: list[str] = [
+    "openrouter/qwen/qwq-32b:free",
+    "openrouter/deepseek/deepseek-r1:free",
+    "openrouter/meta-llama/llama-4-maverick:free",
+]
+
+# All free/local options combined
+FREE_MODELS: list[str] = OLLAMA_MODELS + OPENROUTER_FREE_MODELS
+
 # Context window sizes (tokens)
 CONTEXT_WINDOWS: dict[str, int] = {
     "us.anthropic.claude-opus-4-6-v1": 1_000_000,
@@ -88,6 +108,23 @@ def resolve_model(spec: str, settings: Settings) -> Model:
             return GoogleModel(
                 model_id,
                 provider=GoogleProvider(api_key=settings.gemini_api_key),
+            )
+        case "ollama":
+            base_url = getattr(settings, "ollama_base_url", "http://localhost:11434/v1")
+            return OpenAIModel(
+                model_id,
+                provider=OpenAIProvider(
+                    base_url=base_url,
+                    api_key="ollama",  # Ollama ignores the key
+                ),
+            )
+        case "openrouter":
+            return OpenAIModel(
+                model_id,
+                provider=OpenAIProvider(
+                    base_url="https://openrouter.ai/api/v1",
+                    api_key=getattr(settings, "openrouter_api_key", ""),
+                ),
             )
         case "claude-sdk" | "codex":
             raise ValueError(

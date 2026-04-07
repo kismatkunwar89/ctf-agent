@@ -36,6 +36,10 @@ QUOTA_FALLBACK: dict[str, str] = {
     "codex/gpt-5.4": "azure/gpt-5.4",
     "codex/gpt-5.4-mini": "azure/gpt-5.4-mini",
     "codex/gpt-5.3-codex-spark": "zen/gpt-5.3-codex-spark",
+    # Ollama → OpenRouter free tier if local model unavailable
+    "ollama/qwen2.5-coder:32b": "openrouter/qwen/qwq-32b:free",
+    "ollama/qwen2.5-coder:14b": "openrouter/deepseek/deepseek-r1:free",
+    "ollama/deepseek-r1:14b": "openrouter/deepseek/deepseek-r1:free",
 }
 
 
@@ -109,6 +113,34 @@ class ChallengeSwarm:
                 submit_fn=_submit_fn,
                 message_bus=self.message_bus,
                 notify_coordinator=_notify,
+            )
+
+        if provider == "ollama":
+            from backend.agents.ollama_solver import OllamaSolver
+            return OllamaSolver(
+                model_spec=model_spec,
+                challenge_dir=self.challenge_dir,
+                meta=self.meta,
+                cost_tracker=self.cost_tracker,
+                settings=self.settings,
+                cancel_event=self.cancel_event,
+                no_submit=self.no_submit,
+                submit_fn=_submit_fn,
+                message_bus=self.message_bus,
+                notify_coordinator=_notify,
+            )
+
+        if provider == "openrouter":
+            from backend.agents.openrouter_solver import OpenRouterSolver
+            return OpenRouterSolver(
+                model_spec=model_spec,
+                challenge_dir=self.challenge_dir,
+                meta=self.meta,
+                cost_tracker=self.cost_tracker,
+                settings=self.settings,
+                cancel_event=self.cancel_event,
+                sandbox=None,
+                owns_sandbox=True,
             )
 
         return self._create_pydantic_solver(model_spec)
@@ -284,9 +316,14 @@ class ChallengeSwarm:
                 except TimeoutError:
                     pass  # cooldown elapsed, proceed with bump
                 insights = self._gather_sibling_insights(model_spec)
-                solver.bump(insights)
+                # reflect_and_reset: distill history → clear → fresh start
+                # Falls back to legacy bump() for any solver that doesn't support it yet
+                if hasattr(solver, "reflect_and_reset"):
+                    await solver.reflect_and_reset(insights)
+                else:
+                    solver.bump(insights)
                 logger.info(
-                    f"[{self.meta.name}/{model_spec}] Bumped ({bump_count}), resuming"
+                    f"[{self.meta.name}/{model_spec}] reflect_and_reset #{bump_count}, resuming"
                 )
                 continue
 

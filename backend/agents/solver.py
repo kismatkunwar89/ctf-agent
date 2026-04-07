@@ -42,6 +42,7 @@ from backend.tools.sandbox import (
     write_file,
 )
 from backend.tools.vision import view_image
+from backend.reflexion import SolveReflection, reflect
 from backend.tracing import SolverTracer
 
 logger = logging.getLogger(__name__)
@@ -152,6 +153,10 @@ class Solver:
         self._flag: str | None = None
         self._confirmed: bool = False
         self._findings: str = ""
+        # Reflexion state — set by reflect_and_reset(), consumed at next run start
+        self._reflection: SolveReflection | None = None
+        self._sibling_insights_pending: str = ""
+        self._bump_count: int = 0
 
     async def start(self) -> None:
         """Start the sandbox and build the agent."""
@@ -202,8 +207,18 @@ class Solver:
 
         try:
             from pydantic_ai.usage import UsageLimits
+            # Build initial prompt — inject reflection if this is a fresh post-reset attempt
+            if not self._messages and self._reflection is not None:
+                initial_prompt = self._reflection.to_prompt_block(self._sibling_insights_pending)
+                self._reflection = None
+                self._sibling_insights_pending = ""
+            elif not self._messages:
+                initial_prompt = "Solve this CTF challenge."
+            else:
+                initial_prompt = "Continue solving."
+
             result = await self._agent.run(
-                "Solve this CTF challenge." if not self._messages else "Continue solving.",
+                initial_prompt,
                 deps=self.deps,
                 message_history=self._messages if self._messages else None,
                 usage_limits=UsageLimits(request_limit=None),
@@ -264,8 +279,44 @@ class Solver:
             self.tracer.event("error", error=str(e))
             return self._result(ERROR)
 
+    async def reflect_and_reset(self, sibling_insights: str = "") -> None:
+        """Distill failed history → clear → restart fresh with structured reflection.
+
+        Replaces the legacy bump() append-to-poisoned-history pattern.
+        Token savings: ~55x per bump (60k tokens → 1.1k tokens).
+        Research: Reflexion (Shinn et al. 2023) — 2-2.8x improvement on fresh-context retries.
+        """
+        self._bump_count += 1
+        old_len = len(self._messages)
+
+        reflection = await reflect(
+            messages=self._messages,
+            bump_index=self._bump_count,
+            cheap_model=getattr(self.settings, "reflection_model", "openai:gpt-4o-mini"),
+        )
+        self._reflection = reflection
+        self._sibling_insights_pending = sibling_insights
+
+        # Clear the polluted history — sandbox files survive, only LLM context resets
+        self._messages = []
+        self.loop_detector.reset()
+
+        self.tracer.event(
+            "reflect_and_reset",
+            bump_index=self._bump_count,
+            messages_cleared=old_len,
+            reflection_tokens=reflection.token_estimate(),
+            facts=len(reflection.confirmed_facts),
+            failed=len(reflection.failed_approaches),
+            dead_ends=len(reflection.dead_ends),
+        )
+        logger.info(
+            f"[{self.agent_name}] reflect_and_reset #{self._bump_count}: "
+            f"cleared {old_len} msgs → {reflection.token_estimate()} reflection tokens"
+        )
+
     def bump(self, insights: str) -> None:
-        """Inject insights from siblings and prepare to resume."""
+        """Legacy bump — kept for SDK/Codex solvers. Use reflect_and_reset() for Pydantic AI."""
         bump_msg = ModelRequest(
             parts=[
                 UserPromptPart(
@@ -281,8 +332,8 @@ class Solver:
         )
         self._messages.append(bump_msg)
         self.loop_detector.reset()
-        self.tracer.event("bump", insights=insights[:500])
-        logger.info(f"[{self.agent_name}] Bumped with sibling insights")
+        self.tracer.event("bump_legacy", insights=insights[:500])
+        logger.info(f"[{self.agent_name}] Legacy bump (no reflection)")
 
     def _result(self, status: str, run_steps: int | None = None, run_cost: float | None = None) -> SolverResult:
         agent_usage = self.cost_tracker.by_agent.get(self.agent_name)

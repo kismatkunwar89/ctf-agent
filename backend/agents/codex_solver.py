@@ -462,7 +462,13 @@ class CodexSolver:
         assert self._thread_id
 
         t0 = time.monotonic()
-        if self._bump_insights:
+        reflection = self._reflection
+        sibling = self._sibling_insights_pending
+        if reflection is not None and not self._thread_id:
+            prompt_text = reflection.to_prompt_block(sibling)
+            self._reflection = None
+            self._sibling_insights_pending = ""
+        elif self._bump_insights:
             prompt_text = (
                 "Your previous attempt did not find the flag. "
                 f"Insights from other agents:\n\n{self._bump_insights}\n\n"
@@ -520,7 +526,39 @@ class CodexSolver:
                 return self._result(QUOTA_ERROR)
             return self._result(ERROR)
 
+    async def reflect_and_reset(self, sibling_insights: str = "") -> None:
+        """Kill Codex thread, reflect via tracer log, restart fresh with structured context."""
+        from backend.agents.claude_solver import _tracer_log_to_pseudo_messages
+        self._bump_count += 1
+        pseudo = _tracer_log_to_pseudo_messages(self.tracer.path)
+        reflection = await reflect(
+            messages=pseudo,
+            bump_index=self._bump_count,
+            cheap_model=getattr(self.settings, "reflection_model", "openai:gpt-4o-mini"),
+        )
+        self._reflection = reflection
+        self._sibling_insights_pending = sibling_insights
+        # Kill codex process so next run_until_done_or_gave_up re-initializes a fresh thread
+        if self._proc:
+            try:
+                self._proc.terminate()
+                await asyncio.wait_for(self._proc.wait(), timeout=5)
+            except Exception:
+                pass
+            self._proc = None
+        if self._reader_task:
+            self._reader_task.cancel()
+            self._reader_task = None
+        self._thread_id = None
+        self._bump_insights = None
+        self.loop_detector.reset()
+        self.tracer.event("reflect_and_reset", bump_index=self._bump_count,
+                          reflection_tokens=reflection.token_estimate())
+        logger.info(f"[{self.agent_name}] reflect_and_reset #{self._bump_count}: "
+                    f"codex killed → {reflection.token_estimate()} tokens")
+
     def bump(self, insights: str) -> None:
+        """Legacy bump — use reflect_and_reset() instead."""
         self._bump_insights = insights
         self.loop_detector.reset()
         self.tracer.event("bump", insights=insights[:500])

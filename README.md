@@ -1,152 +1,143 @@
-# CTF Agent
+# CTF Agent — Enhanced Fork
 
-Autonomous CTF (Capture The Flag) solver that races multiple AI models against challenges in parallel. Built in a weekend, we used it to solve all 52/52 challenges and win **1st place at BSidesSF 2026 CTF**.
+Autonomous CTF solver forked from [verialabs/ctf-agent](https://github.com/verialabs/ctf-agent) (1st place BSidesSF 2026, 52/52 challenges).
 
-Built by [Veria Labs](https://verialabs.com), founded by members of [.;,;.](https://ctftime.org/team/222911) (smiley), the [#1 US CTF team on CTFTime in 2024 and 2025](https://ctftime.org/stats/2024/US). We build AI agents that find and exploit real security vulnerabilities for large enterprises.
+## What's New in This Fork
 
-## Results
+### 1. `reflect_and_reset()` — Fixes the core bottleneck
 
-| Competition | Challenges Solved | Result |
-|-------------|:-:|--------|
-| **BSidesSF 2026** | 52/52 (100%) | **1st place ($1,500)** |
+**The problem**: When a solver gives up and gets "bumped", the original code appends sibling insights to a 40k-80k token pile of failed attempts. The model is asked to think differently while cognitively drowned in everything that didn't work.
 
-The agent solves challenges across all categories — pwn, rev, crypto, forensics, web, and misc.
-
-## How It Works
-
-A **coordinator** LLM manages the competition while **solver swarms** attack individual challenges. Each swarm runs multiple models simultaneously — the first to find the flag wins.
+**The fix**: After each failed attempt, a cheap model (gpt-4o-mini, ~$0.001) distills the history into a compact `SolveReflection` — confirmed facts, failed approaches, dead ends, sandbox artifacts, best hypothesis. The message history is then **cleared**. The next attempt starts fresh with only the 400-token structured reflection.
 
 ```
-                        +-----------------+
-                        |  CTFd Platform  |
-                        +--------+--------+
-                                 |
-                        +--------v--------+
-                        |  Poller (5s)    |
-                        +--------+--------+
-                                 |
-                        +--------v--------+
-                        | Coordinator LLM |
-                        | (Claude/Codex)  |
-                        +--------+--------+
-                                 |
-              +------------------+------------------+
-              |                  |                  |
-     +--------v--------+ +------v---------+ +------v---------+
-     | Swarm:          | | Swarm:         | | Swarm:         |
-     | challenge-1     | | challenge-2    | | challenge-N    |
-     |                 | |                | |                |
-     |  Opus (med)     | |  Opus (med)    | |                |
-     |  Opus (max)     | |  Opus (max)    | |     ...        |
-     |  GPT-5.4        | |  GPT-5.4       | |                |
-     |  GPT-5.4-mini   | |  GPT-5.4-mini  | |                |
-     |  GPT-5.3-codex  | |  GPT-5.3-codex | |                |
-     +--------+--------+ +--------+-------+ +----------------+
-              |                    |
-     +--------v--------+  +-------v--------+
-     | Docker Sandbox  |  | Docker Sandbox |
-     | (isolated)      |  | (isolated)     |
-     |                 |  |                |
-     | pwntools, r2,   |  | pwntools, r2,  |
-     | gdb, python...  |  | gdb, python... |
-     +-----------------+  +----------------+
+Before: 60,000 tokens of failure → model produces variation of failure
+After:  1,100 tokens of structure → model starts genuinely fresh
+Savings: ~55x input token reduction per bump. Research: Reflexion (Shinn et al. 2023) → 2-2.8x improvement.
 ```
 
-Each solver runs in an isolated Docker container with CTF tools pre-installed. Solvers never give up — they keep trying different approaches until the flag is found.
+All three solver types updated: `Solver` (Pydantic AI), `ClaudeSolver`, `CodexSolver`.
+
+### 2. `OllamaSolver` — Free local models, zero API cost
+
+Run CTF challenges with local Qwen2.5-Coder, DeepSeek-R1, or Llama3 via Ollama:
+- Full tool support (bash, file ops, flag submission, webhooks, sibling findings)
+- Thought-action fallback for models that don't emit structured tool_calls
+- Retry logic for model loading delays
+- Automatic fallback to OpenRouter free tier if Ollama unreachable
+
+### 3. OpenRouter free-tier support
+
+Added `openrouter/` provider for free cloud models (qwq-32b, deepseek-r1, llama-4-maverick) as fallback when local models are unavailable.
 
 ## Quick Start
 
 ```bash
-# Install
 uv sync
-
-# Build sandbox image
 docker build -f sandbox/Dockerfile.sandbox -t ctf-sandbox .
-
-# Configure credentials
 cp .env.example .env
-# Edit .env with your API keys and CTFd token
+# Edit .env with your credentials
+```
 
-# Run against a CTFd instance
+### Run with Claude Code + Codex (subscription, no per-token cost)
+```bash
 uv run ctf-solve \
   --ctfd-url https://ctf.example.com \
   --ctfd-token ctfd_your_token \
-  --challenges-dir challenges \
-  --max-challenges 10 \
-  -v
+  --coordinator claude
 ```
 
-## Coordinator Backends
-
+### Run free — Ollama only
 ```bash
-# Claude SDK coordinator (default)
-uv run ctf-solve --coordinator claude ...
+# 1. Install Ollama: https://ollama.com
+ollama pull qwen2.5-coder:14b
 
-# Codex coordinator (GPT-5.4 via JSON-RPC)
-uv run ctf-solve --coordinator codex ...
+# 2. Run with local model only
+uv run ctf-solve \
+  --ctfd-url https://ctf.example.com \
+  --ctfd-token ctfd_your_token \
+  --models ollama/qwen2.5-coder:14b \
+  --coordinator claude
+```
+
+### Run free — OpenRouter free tier
+```bash
+# Set OPENROUTER_API_KEY in .env, then:
+uv run ctf-solve \
+  --ctfd-url https://ctf.example.com \
+  --ctfd-token ctfd_your_token \
+  --models openrouter/qwen/qwq-32b:free,openrouter/deepseek/deepseek-r1:free
+```
+
+### Mix paid + free in the same swarm
+```bash
+uv run ctf-solve \
+  --ctfd-url https://ctf.example.com \
+  --ctfd-token ctfd_your_token \
+  --models claude-sdk/claude-opus-4-6/medium,codex/gpt-5.4,ollama/qwen2.5-coder:14b
+```
+
+## Architecture
+
+```
+CTFd Poller (5s)
+    │
+    ▼
+Coordinator (Claude SDK or Codex)
+    │  spawn_swarm, check_status
+    │
+    ▼ per-challenge
+ChallengeSwarm ──── MessageBus ──── cross-solver findings
+    │
+    ├── ClaudeSolver    (claude-sdk/*)   subscription, reflect_and_reset via session close
+    ├── CodexSolver     (codex/*)        subscription, reflect_and_reset via thread kill
+    ├── Solver          (bedrock/azure)  API, reflect_and_reset via message clear
+    ├── OllamaSolver    (ollama/*)       FREE local, reflect_and_reset native
+    └── OpenRouterSolver (openrouter/*) FREE cloud, reflect_and_reset native
+         Each in isolated Docker (Kali) sandbox ↑
+```
+
+### Reflect & Reset Flow
+```
+Attempt 1: 30 tool calls → GAVE_UP
+    ↓
+reflect_and_reset():
+  gpt-4o-mini reads trace → SolveReflection (confirmed facts, failures, next step)
+  message history CLEARED (sandbox files survive)
+    ↓
+Attempt 2: starts with 400-token structured context, not 60k token failure pile
 ```
 
 ## Solver Models
 
-Default model lineup (configurable in `backend/models.py`):
-
-| Model | Provider | Notes |
-|-------|----------|-------|
-| Claude Opus 4.6 (medium) | Claude SDK | Balanced speed/quality |
-| Claude Opus 4.6 (max) | Claude SDK | Deep reasoning |
-| GPT-5.4 | Codex | Best overall solver |
-| GPT-5.4-mini | Codex | Fast, good for easy challenges |
-| GPT-5.3-codex | Codex | Reasoning model (xhigh effort) |
-
-## Sandbox Tooling
-
-Each solver gets an isolated Docker container pre-loaded with CTF tools:
-
-| Category | Tools |
-|----------|-------|
-| **Binary** | radare2, GDB, objdump, binwalk, strings, readelf |
-| **Pwn** | pwntools, ROPgadget, angr, unicorn, capstone |
-| **Crypto** | SageMath, RsaCtfTool, z3, gmpy2, pycryptodome, cado-nfs |
-| **Forensics** | volatility3, Sleuthkit (mmls/fls/icat), foremost, exiftool |
-| **Stego** | steghide, stegseek, zsteg, ImageMagick, tesseract OCR |
-| **Web** | curl, nmap, Python requests, flask |
-| **Misc** | ffmpeg, sox, Pillow, numpy, scipy, PyTorch, podman |
-
-## Features
-
-- **Multi-model racing** — multiple AI models attack each challenge simultaneously
-- **Auto-spawn** — new challenges detected and attacked automatically
-- **Coordinator LLM** — reads solver traces, crafts targeted technical guidance
-- **Cross-solver insights** — findings shared between models via message bus
-- **Docker sandboxes** — isolated containers with full CTF tooling
-- **Operator messaging** — send hints to running solvers mid-competition
+| Spec | Provider | Cost | Notes |
+|------|----------|------|-------|
+| `claude-sdk/claude-opus-4-6/medium` | Claude Pro | Subscription | Best quality |
+| `claude-sdk/claude-opus-4-6/max` | Claude Pro | Subscription | Extended thinking |
+| `codex/gpt-5.4` | ChatGPT Plus | Subscription | Best overall |
+| `codex/gpt-5.4-mini` | ChatGPT Plus | Subscription | Fast |
+| `codex/gpt-5.3-codex` | ChatGPT Plus | Subscription | Reasoning (xhigh) |
+| `ollama/qwen2.5-coder:32b` | Local | **Free** | Best local CTF model |
+| `ollama/qwen2.5-coder:14b` | Local | **Free** | Good balance |
+| `ollama/deepseek-r1:14b` | Local | **Free** | Strong reasoning |
+| `openrouter/qwen/qwq-32b:free` | OpenRouter | **Free** | Rate-limited |
+| `openrouter/deepseek/deepseek-r1:free` | OpenRouter | **Free** | Rate-limited |
+| `bedrock/us.anthropic.claude-opus-4-6-v1` | AWS | API | Quota fallback |
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill in your keys:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ANTHROPIC_API_KEY` | — | For Claude API / bedrock fallback |
+| `OPENAI_API_KEY` | — | For Codex API / gpt-4o-mini reflection |
+| `REFLECTION_MODEL` | `openai:gpt-4o-mini` | Model used for reflect_and_reset() distillation |
+| `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | Ollama endpoint |
+| `OLLAMA_MODEL` | `ollama/qwen2.5-coder:14b` | Default local model |
+| `OPENROUTER_API_KEY` | — | For OpenRouter free/paid models |
 
-```bash
-cp .env.example .env
-```
+## Credits
 
-```env
-CTFD_URL=https://ctf.example.com
-CTFD_TOKEN=ctfd_your_token
-ANTHROPIC_API_KEY=sk-ant-...
-OPENAI_API_KEY=sk-...
-GEMINI_API_KEY=...
-```
-
-All settings can also be passed as environment variables or CLI flags.
-
-## Requirements
-
-- Python 3.14+
-- Docker
-- API keys for at least one provider (Anthropic, OpenAI, Google)
-- `codex` CLI (for Codex solver/coordinator)
-- `claude` CLI (bundled with claude-agent-sdk)
-
-## Acknowledgements
-
-- [es3n1n/Eruditus](https://github.com/es3n1n/Eruditus) — CTFd interaction and HTML helpers in `pull_challenges.py`
+- [verialabs/ctf-agent](https://github.com/verialabs/ctf-agent) — original architecture, 1st place BSidesSF 2026
+- [Reflexion (Shinn et al. 2023)](https://arxiv.org/abs/2303.11366) — context reset research backing
+- [Orionband/ctf-agent](https://github.com/Orionband/ctf-agent) — OpenRouter solver pattern
+- [HackSynth](https://arxiv.org/html/2412.01778v1) — Summarizer architecture reference
